@@ -10,6 +10,7 @@ static ALLOC: near_sdk::wee_alloc::WeeAlloc<'_> = near_sdk::wee_alloc::WeeAlloc:
 
 const MAX_DESCRIPTION_LENGTH: usize = 280;
 
+
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 pub enum Vote {
@@ -160,9 +161,16 @@ pub struct SputnikDAO {
     bond: Balance,
     vote_period: Duration,
     grace_period: Duration,
+    epoch: u64,
+    epoch_duration: Duration,
+    init_time: u64,
     policy: Vec<PolicyItem>,
     council: UnorderedSet<AccountId>,
+    successors: UnorderedSet<AccountId>,
+    citizens: UnorderedSet<AccountId>,
     proposals: Vector<Proposal>,
+    daggers: HashMap<AccountId, u32>,
+    flowers: HashMap<AccountId, u32>,
 }
 
 impl Default for SputnikDAO {
@@ -177,9 +185,13 @@ impl SputnikDAO {
     pub fn new(
         purpose: String,
         council: Vec<AccountId>,
+        successors: Vec<AccountId>,
+        citizens: Vec<AccountId>,
         bond: WrappedBalance,
         vote_period: WrappedDuration,
         grace_period: WrappedDuration,
+        epoch_duration: WrappedDuration,
+
     ) -> Self {
         assert!(!env::state_exists(), "The contract is already initialized");
 
@@ -188,16 +200,36 @@ impl SputnikDAO {
             bond: bond.into(),
             vote_period: vote_period.into(),
             grace_period: grace_period.into(),
+            epoch: 1,
+            epoch_duration: epoch_duration.into(),
+            init_time: env::block_timestamp(),
             policy: vec![PolicyItem {
                 max_amount: 0.into(),
                 votes: NumOrRatio::Ratio(1, 2),
             }],
             council: UnorderedSet::new(b"c".to_vec()),
+            successors: UnorderedSet::new(b"s".to_vec()),
+            citizens: UnorderedSet::new(b"d".to_vec()),
             proposals: Vector::new(b"p".to_vec()),
+            daggers: HashMap::new(),
+            flowers: HashMap::new(),
         };
         for account_id in council {
             dao.council.insert(&account_id);
+            dao.daggers.insert(account_id.clone(), 0);
         }
+        for account_id in successors {
+            assert!(!dao.council.contains(&account_id), "member cannot be in two groups");
+            dao.successors.insert(&account_id);
+            dao.daggers.insert(account_id.clone(), 0);
+            dao.flowers.insert(account_id.clone(), 0);
+        }
+        for account_id in citizens {
+            assert!(!dao.council.contains(&account_id) && !dao.successors.contains(&account_id), "member cannot be in two groups");
+            dao.citizens.insert(&account_id);
+            dao.flowers.insert(account_id.clone(), 0);
+        }
+
         dao
     }
 
@@ -244,6 +276,16 @@ impl SputnikDAO {
         };
         self.proposals.push(&p);
         self.proposals.len() - 1
+    }
+
+    pub fn get_daggers(&self, account_id: AccountId) -> u32 {
+        let value = self.daggers[&account_id];
+        value
+    }
+
+    pub fn get_flowers(&self, account_id: AccountId) -> u32 {
+        let value = self.flowers[&account_id];
+        value
     }
 
     pub fn get_vote_period(&self) -> WrappedDuration {
@@ -312,6 +354,20 @@ impl SputnikDAO {
         self.purpose.clone()
     }
 
+    pub fn add_dagger(&mut self, id: AccountId) {
+        assert!(self.council.contains(&id) || self.successors.contains(&id), "Member is not part of council or successors");
+        
+        let count = self.daggers.entry(id).or_insert(1);
+        *count += 1; 
+    } 
+
+    pub fn add_flower(&mut self, id: AccountId) {
+        assert!(self.citizens.contains(&id) || self.successors.contains(&id), "Member is not part of council or successors");
+
+        let count = self.flowers.entry(id).or_insert(1);
+        *count += 1; 
+    } 
+
     pub fn vote(&mut self, id: u64, vote: Vote) {
         assert!(
             self.council.contains(&env::predecessor_account_id()),
@@ -348,6 +404,7 @@ impl SputnikDAO {
         if post_status.is_finalized() {
             self.finalize(id);
         }
+        self.add_flower(env::predecessor_account_id());
     }
 
     pub fn finalize(&mut self, id: u64) {
@@ -400,7 +457,66 @@ impl SputnikDAO {
         }
         self.proposals.replace(id, &proposal);
     }
+
+    fn update_council(&mut self, council: Vec<AccountId>) {
+        let max = 0;
+        let mut max_daggers: AccountId = 0.to_string();
+        for account in council.iter() {
+            self.add_dagger(account.to_string());
+            if self.get_daggers(account.to_string()) > max {
+                max_daggers = account.to_string();
+            }
+        }
+        self.council.remove(&max_daggers.to_string());
+        self.citizens.insert(&max_daggers.to_string());
+        self.daggers.remove(&max_daggers.to_string());
+        self.flowers.remove(&max_daggers.to_string());
+    }
+
+    fn update_successors(&mut self, succesors: Vec<AccountId>) {
+        let max = 0;
+        let mut max_flowers: AccountId = 0.to_string();
+        for account in succesors.iter() {
+            self.add_flower(account.to_string());
+            self.add_flower(account.to_string());
+            if self.get_flowers(account.to_string()) > max {
+                max_flowers = account.to_string();
+            }
+        }
+        self.successors.remove(&max_flowers.to_string());
+        self.council.insert(&max_flowers.to_string());
+        
+    }
+
+    fn update_citizens(&mut self, citizens: Vec<AccountId>) {
+        let max = 0;
+        let mut max_flowers: AccountId = 0.to_string();
+        for account in citizens.iter() {
+            self.add_flower(account.to_string());
+            if self.get_flowers(account.to_string()) > max {
+                max_flowers = account.to_string();
+            }
+        }
+        self.citizens.remove(&max_flowers.to_string());
+        self.successors.insert(&max_flowers.to_string());
+
+    }
+
+    fn update_dao(&mut self) {
+        assert!(self.epoch * self.epoch_duration < env::block_timestamp() - self.init_time, "not enough time has past");
+
+        let council = self.council.to_vec();
+        let successors = self.successors.to_vec();
+        let citizens =self.citizens.to_vec();
+
+        self.update_council(council);
+        self.update_successors(successors);
+        self.update_citizens(citizens);
+
+        self.epoch += 1;
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -424,11 +540,18 @@ mod tests {
         let mut dao = SputnikDAO::new(
             "test".to_string(),
             vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
             1_000.into(),
             10.into(),
+            10.into(),
         );
 
+        dao.add_dagger(accounts(1).as_ref().into());
+        dao.add_dagger(accounts(1).as_ref().into());
+        assert_eq!(dao.get_daggers(accounts(1).as_ref().into()), 2);
+        assert_eq!(dao.get_daggers(accounts(0).as_ref().into()), 0);
         assert_eq!(dao.get_bond(), 10.into());
         assert_eq!(dao.get_vote_period(), 1_000.into());
         assert_eq!(dao.get_purpose(), "test");
@@ -565,9 +688,12 @@ mod tests {
         testing_env!(VMContextBuilder::new().build());
         let mut dao = SputnikDAO::new(
             "test".to_string(),
-            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into(), accounts(2).as_ref().into()],
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
             1_000.into(),
+            10.into(),
             10.into(),
         );
 
@@ -576,7 +702,7 @@ mod tests {
             .attached_deposit(10)
             .build());
         let id = dao.add_proposal(ProposalInput {
-            target: accounts(5).as_ref().into(),
+            target: accounts(2).as_ref().into(),
             description: "add new member".to_string(),
             kind: ProposalKind::NewCouncil,
         });
@@ -594,8 +720,11 @@ mod tests {
         let mut dao = SputnikDAO::new(
             "".to_string(),
             vec![accounts(0).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
             1_000.into(),
+            1000.into(),
             10.into(),
         );
 
@@ -622,7 +751,10 @@ mod tests {
         let mut dao = SputnikDAO::new(
             "".to_string(),
             vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
+            1000.into(),
             1000.into(),
             10.into(),
         );
@@ -649,8 +781,11 @@ mod tests {
         let mut dao = SputnikDAO::new(
             "".to_string(),
             vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
             1_000.into(),
+            1000.into(),
             10.into(),
         );
 
@@ -674,7 +809,10 @@ mod tests {
         let mut dao = SputnikDAO::new(
             "".to_string(),
             vec![accounts(0).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
+            1000.into(),
             1000.into(),
             10.into(),
         );
@@ -704,7 +842,10 @@ mod tests {
         let mut dao = SputnikDAO::new(
             "".to_string(),
             vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
             10.into(),
+            1000.into(),
             1000.into(),
             10.into(),
         );
@@ -728,5 +869,30 @@ mod tests {
                 ],
             },
         });
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_epochs() {
+        testing_env!(VMContextBuilder::new().build());
+        let mut dao = SputnikDAO::new(
+            "".to_string(),
+            vec![accounts(0).as_ref().into(), accounts(1).as_ref().into()],
+            vec![accounts(2).as_ref().into(), accounts(3).as_ref().into()],
+            vec![accounts(4).as_ref().into(), accounts(5).as_ref().into()],
+            10.into(),
+            1000.into(),
+            1000.into(),
+            10.into(),
+        );
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(accounts(2))
+            .attached_deposit(10)
+            .build());
+        
+        dao.update_dao();
+        
+        
+
     }
 }
